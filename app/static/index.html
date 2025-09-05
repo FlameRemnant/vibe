@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vertical Boss Chase – Moving Platforms, Boss Clouds, Double Jump, Side Projectiles</title>
+  <style>
+    :root { --bg: #0f1220; --ink: #e6e6f0; --accent: #7dd3fc; --accent2:#a78bfa; --danger:#ef4444; --ok:#10b981; }
+    html, body { height: 100%; margin: 0; background: radial-gradient(1200px 600px at 50% 20%, #151833 0%, var(--bg) 60%); color: var(--ink); font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans"; }
+    #wrap { display:flex; align-items:center; justify-content:center; height:100%; gap:16px; flex-direction:column; }
+    canvas { background: linear-gradient(#0b0e1a,#0b0e1a 60%, #0a0d19 100%); border-radius: 16px; box-shadow: 0 30px 80px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.05); image-rendering: pixelated; }
+    .hud { text-align:center; opacity:.95; font-size:14px; line-height:1.4; }
+    kbd { padding:2px 6px; border-radius:6px; border:1px solid #2a2f4a; background:#0b0f25; color:#cbd5e1; box-shadow: inset 0 1px 0 rgba(255,255,255,.05); }
+    .btnbar { display:flex; gap:8px; justify-content:center; }
+    button { background:#111633; color:#cbd5e1; border:1px solid #2a2f4a; border-radius:10px; padding:8px 12px; cursor:pointer; }
+    button:hover { border-color:#4053a8; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div class="hud">
+    <div class="btnbar">
+      <button id="resetBtn" title="Reset (R)">Reset</button>
+      <button id="pauseBtn" title="Pause (P)">Pause</button>
+      <button id="fpsBtn" title="Toggle FPS (F)">FPS</button>
+    </div>
+    <p>
+      Climb the tower. Boss is invulnerable and spawns **temporary platforms** mid‑jump. Ground spikes = instant death. 
+      Now with **Double Jump (3s cooldown)** and **projectiles from side walls**. Controls: Move <kbd>A</kbd>/<kbd>D</kbd> or <kbd>←</kbd>/<kbd>→</kbd>, Jump <kbd>Space</kbd>, Parry <kbd>J</kbd>, Mikiri <kbd>K</kbd> or <kbd>↓</kbd>+<kbd>J</kbd>, Reset <kbd>R</kbd>, Pause <kbd>P</kbd>.
+    </p>
+  </div>
+</div>
+<script>
+(() => {
+  // ===== Canvas & DPI-Scaling =====
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const DESIGN_W = 960, DESIGN_H = 540;
+  function fitCanvas() {
+    const scale = Math.min(window.innerWidth / DESIGN_W, (window.innerHeight-120) / DESIGN_H);
+    canvas.style.width = `${DESIGN_W * scale}px`;
+    canvas.style.height = `${DESIGN_H * scale}px`;
+  }
+  window.addEventListener('resize', fitCanvas); fitCanvas();
+
+  // ===== Utilities =====
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const nowMs = () => performance.now();
+  const lerp = (a,b,t)=> a+(b-a)*t;
+
+  // ===== Input =====
+  const keys = new Set();
+  window.addEventListener('keydown', e => {
+    keys.add(e.code); keys.add(e.key);
+    if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+    if (e.code==='KeyJ' || e.key==='j' || e.key==='J') { player.lastParry = nowMs(); if (keys.has('ArrowDown')||keys.has('KeyS')||keys.has('s')||keys.has('S')) player.lastMikiri = player.lastParry; }
+    if (e.code==='KeyK' || e.key==='k' || e.key==='K') { player.lastMikiri = nowMs(); }
+  });
+  window.addEventListener('keyup', e => { keys.delete(e.code); keys.delete(e.key); });
+  const downLeft = () => keys.has('ArrowLeft') || keys.has('KeyA') || keys.has('a') || keys.has('A') || keys.has('Left');
+  const downRight= () => keys.has('ArrowRight')|| keys.has('KeyD') || keys.has('d') || keys.has('D') || keys.has('Right');
+  const downUp   = () => keys.has('ArrowUp')   || keys.has('KeyW') || keys.has('w') || keys.has('W') || keys.has('Space');
+  const downDown = () => keys.has('ArrowDown') || keys.has('KeyS') || keys.has('s') || keys.has('S');
+
+  // ===== Camera =====
+  const camera = { x:0, y:0, w:DESIGN_W, h:DESIGN_H, lerp:0.16 };
+
+  // ===== World =====
+  const WORLD_H = 4200, WORLD_W = 960;
+  const GROUND_Y = WORLD_H - 60;
+  const SPIKE_H = 24;
+
+  class Rect { constructor(x,y,w,h){ this.x=x; this.y=y; this.w=w; this.h=h; } }
+  const AABB = (a,b)=> a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  class Platform extends Rect{
+    constructor(x,y,w,h, opts={}){ super(x,y,w,h); this.moving=opts.moving||false; this.axis=opts.axis||'x'; this.amp=opts.amp||0; this.speed=opts.speed||0; this.baseX=x; this.baseY=y; this.phase=opts.phase||0; this.temp=false; this.alpha=1; this.expires=Infinity; }
+    update(dt, t){
+      if (this.moving){
+        const off = Math.sin((t/1000)*this.speed + this.phase) * this.amp;
+        if (this.axis==='x') this.x = this.baseX + off; else this.y = this.baseY + off;
+      }
+      if (this.temp){
+        const remain = this.expires - t; this.alpha = clamp(remain/800, 0, 1);
+      }
+    }
+  }
+
+  // ===== Physics =====
+  const GRAVITY = 2000; const MOVE_SPEED = 340; const JUMP_VY = -850; const FRICTION = 0.85; const AIR_DRAG = 0.995; const MAX_FALL = 1200;
+
+  function applyGravity(e, dt){ e.vy += GRAVITY*dt; e.vy = clamp(e.vy, -Infinity, MAX_FALL); }
+
+  function collideWithPlatforms(entity, dt, plats){
+    // Move horizontally
+    entity.x += entity.vx * dt;
+    for (const p of plats){ if (AABB(entity.rect(), p)){ if (entity.vx>0) entity.x = p.x - entity.w; else if (entity.vx<0) entity.x = p.x + p.w; entity.vx = 0; } }
+    // Move vertically
+    entity.y += entity.vy * dt; entity.onGround=false;
+    for (const p of plats){ if (AABB(entity.rect(), p)){ if (entity.vy>0){ entity.y = p.y - entity.h; entity.vy=0; entity.onGround=true; } else if (entity.vy<0){ entity.y = p.y + p.h; entity.vy=0; } } }
+  }
+
+  function clampToWorld(e){ e.x = clamp(e.x, 0, WORLD_W - e.w); if (e.y > WORLD_H - e.h) e.y = WORLD_H - e.h; }
+  function playerDamage(n=1){ const t = nowMs(); if (t < player.invulnUntil) return; player.hp -= n; player.invulnUntil = t + 500; if (player.hp <= 0) reset(); }
+
+  // ===== Build Tower (varied sizes + movers) =====
+  const platforms = [];
+  (function buildTower(){
+    const steps = 20; const baseY = GROUND_Y - 40; const minW=140, maxW=460; const gapYMin=130, gapYMax=190;
+    let y = baseY; let left = true;
+    for (let i=0;i<steps;i++){
+      const w = Math.floor(lerp(minW, maxW, Math.random()));
+      const gapY = Math.floor(lerp(gapYMin, gapYMax, Math.random()));
+      y -= gapY; if (y < 200) break;
+      const x = left ? 60 : (WORLD_W - 60 - w);
+      left = !left;
+      const moving = Math.random() < 0.35;
+      const axis = Math.random() < 0.5 ? 'x' : 'y';
+      const amp = axis==='x' ? Math.floor(40+Math.random()*110) : Math.floor(20+Math.random()*60);
+      const speed = 0.6 + Math.random()*1.2;
+      platforms.push(new Platform(x, y, w, 22, moving? {moving:true, axis, amp, speed, phase:Math.random()*Math.PI*2}:{}));
+    }
+  })();
+
+  const GOAL = new Rect(WORLD_W/2-20, platforms[platforms.length-1].y - 140, 40, 60);
+  const SPIKES = new Rect(0, GROUND_Y, WORLD_W, SPIKE_H);
+
+  // ===== Entities =====
+  class Player {
+    constructor(x,y){
+      this.spawnX=x; this.spawnY=y; this.x=x; this.y=y; this.w=28; this.h=38; this.vx=0; this.vy=0; this.onGround=false;
+      this.hp=3; this.posture=0; this.stunUntil=0; this.lastParry=-9999; this.lastMikiri=-9999; this.invulnUntil=0; this.facing=1;
+      this.swingStart=-9999; this.swingDur=200; this.swingType='none';
+      // Double-jump
+      this.doubleReadyAt=0; this.usedDouble=false; // reset usedDouble on landing
+    }
+    rect(){ return new Rect(this.x, this.y, this.w, this.h); }
+    reset(){ this.x=this.spawnX; this.y=this.spawnY; this.vx=0; this.vy=0; this.onGround=false; this.hp=3; this.posture=0; this.stunUntil=0; this.invulnUntil=0; this.swingStart=-9999; this.doubleReadyAt=0; this.usedDouble=false; }
+  }
+
+  class Boss { constructor(x,y){ this.x=x; this.y=y; this.w=32; this.h=42; this.vx=0; this.vy=0; this.onGround=false; this.dir=1; this.state='chase'; this.t0=nowMs(); this.lastJump=-9999; this.swingStart=-9999; this.swingDur=160; this.invulnerable=true; this.cloudCooldown=0; }
+    rect(){ return new Rect(this.x, this.y, this.w, this.h); } }
+
+  const player = new Player(platforms[0].x + 40, platforms[0].y - 38);
+  const boss = new Boss(player.x + 180, player.y - 2);
+
+  // Boss-created temporary platforms
+  const tempPlatforms = []; // Platform objects with temp=true, expires timestamp
+
+  // ===== Projectiles from side walls =====
+  class Projectile { constructor(x,y,vx,vy){ this.x=x; this.y=y; this.vx=vx; this.vy=vy; this.w=18; this.h=8; this.life=6000; this.fromLeft = vx>0; } rect(){ return new Rect(this.x, this.y, this.w, this.h); } }
+  const projectiles = []; let lastProjAt = 0; const PROJ_COOLDOWN = 900; const PROJ_SPEED = 260;
+  function spawnProjectile(t){
+    const side = Math.random()<0.5? 'left':'right';
+    const y = clamp(player.y + player.h/2 + (Math.random()*180-90), 120, WORLD_H-120);
+    if (side==='left') projectiles.push(new Projectile(2, y, PROJ_SPEED, 0));
+    else projectiles.push(new Projectile(WORLD_W-20, y, -PROJ_SPEED, 0));
+    lastProjAt = t;
+  }
+
+  // ===== Game State =====
+  let last = performance.now(); let accumulator=0; const FIXED_DT = 1/120; let paused=false, showFPS=false; let fps=0, fpsTimer=0, frameCount=0; let prevJump=false;
+  document.getElementById('resetBtn').onclick = reset;
+  document.getElementById('pauseBtn').onclick = ()=> paused = !paused;
+  document.getElementById('fpsBtn').onclick = ()=> showFPS = !showFPS;
+
+  function reset(){
+    player.reset(); player.x = platforms[0].x + 40; player.y = platforms[0].y - 38;
+    boss.x = player.x + 180; boss.y = player.y - 2; boss.vx=0; boss.vy=0; boss.lastJump=-9999; boss.state='chase'; boss.cloudCooldown=0;
+    tempPlatforms.length=0; slashes.length=0; sparks.length=0; projectiles.length=0; lastProjAt=0;
+  }
+
+  function loop(now){
+    const dt = Math.min(0.033, (now-last)/1000); last=now;
+    if (!paused){ accumulator += dt; while (accumulator >= FIXED_DT){ step(FIXED_DT); accumulator -= FIXED_DT; } }
+    render();
+    frameCount++; fpsTimer += dt; if (fpsTimer >= 0.5){ fps = Math.round(frameCount / fpsTimer); frameCount=0; fpsTimer=0; }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ===== Effects =====
+  const sparks = []; function spawnSparks(x,y,n=8,color='#f8fafc'){ for(let i=0;i<n;i++){ sparks.push({x,y, vx:(Math.random()*2-1)*220, vy:(Math.random()*2-1)*160, life:240, color}); } }
+  const slashes = []; function spawnSlashArc(opts){ slashes.push(Object.assign({life:200,color:'#ff2b2b',radius:36,thickness:10}, opts)); }
+
+  // ===== AI =====
+  const BOSS_JUMP_CADENCE = 520; const BOSS_CHASE_SPEED = 260; const BOSS_RANGE_X=84; const BOSS_RANGE_Y=52; const BOSS_WINDUP=420; const BOSS_ACTIVE=100; const BOSS_RECOVER=300;
+
+  function bossAI(t, dt){
+    // Apply gravity
+    applyGravity(boss, dt);
+
+    // Horizontal chase toward player x
+    boss.dir = (player.x > boss.x) ? 1 : -1;
+    const targetVX = boss.dir * BOSS_CHASE_SPEED;
+    boss.vx = lerp(boss.vx, targetVX, 0.12);
+
+    // Jump if player is above and cooldown ready
+    const needJump = (player.y + player.h) < (boss.y - 12);
+    if (needJump && (t - boss.lastJump) > BOSS_JUMP_CADENCE && boss.onGround){ boss.vy = JUMP_VY * 0.96; boss.lastJump = t; boss.swingStart = t; }
+
+    // While in air, periodically spawn temporary platforms for both
+    if (!boss.onGround){
+      boss.cloudCooldown -= dt*1000;
+      if (boss.cloudCooldown <= 0){
+        const cloudW = 110 + Math.random()*100; const cloudH = 18;
+        const px = clamp(boss.x + (Math.random()*60-30), 20, WORLD_W - 20 - cloudW);
+        const py = boss.y + boss.h + 40 + Math.random()*30; // slightly below boss
+        const cloud = new Platform(px, py, cloudW, cloudH, {});
+        cloud.temp=true; cloud.expires = t + 1600 + Math.random()*700; cloud.alpha=1;
+        tempPlatforms.push(cloud);
+        boss.cloudCooldown = 220 + Math.random()*220;
+      }
+    } else {
+      boss.cloudCooldown = 0; // reset cadence when grounded
+    }
+
+    // Simple attack timing only when near (for parry visuals; boss is invulnerable)
+    const inY = Math.abs((boss.y+boss.h/2) - (player.y+player.h/2)) < BOSS_RANGE_Y;
+    const inX = Math.abs((player.x+player.w/2) - (boss.x+boss.w/2)) < 200;
+    if (boss.state==='chase' && inY && inX){ boss.state='windup'; boss.t0=t; }
+    else if (boss.state==='windup'){ if (t - boss.t0 >= BOSS_WINDUP){ boss.state='active'; boss.t0=t; boss.swingStart=t; } }
+    else if (boss.state==='active'){
+      const inXHit = Math.abs((player.x+player.w/2) - (boss.x+boss.w/2)) < BOSS_RANGE_X;
+      if (inY && inXHit){
+        const dParry = Math.abs(t - player.lastParry); const dMikiri = Math.abs(t - player.lastMikiri);
+        if (dParry <= 110){ spawnSparks((player.x+boss.x)/2, (player.y+boss.y)/2, 16, '#e5e7eb'); spawnSlashArc({x: player.facing>0? player.x+player.w : player.x, y: player.y+14, dir: player.facing}); player.swingStart=t; player.swingType='parry'; }
+        else if (dParry <= 300){ spawnSparks((player.x+boss.x)/2, (player.y+boss.y)/2, 10, '#a7f3d0'); }
+        else if (dMikiri <= 150){ spawnSparks((player.x+boss.x)/2, (player.y+boss.y)/2, 10, '#93c5fd'); player.swingStart=t; player.swingType='mikiri'; }
+        else { playerDamage(1); }
+        boss.state='recover'; boss.t0=t;
+      }
+      if (t - boss.t0 >= BOSS_ACTIVE){ boss.state='recover'; boss.t0=t; }
+    }
+    else if (boss.state==='recover'){ if (t - boss.t0 >= BOSS_RECOVER){ boss.state='chase'; } }
+
+    // Collide and clamp after velocity
+    collideWithPlatforms(boss, dt, allPlatforms());
+    clampToWorld(boss);
+  }
+
+  // ===== Step =====
+  function allPlatforms(){ return platforms.concat(tempPlatforms); }
+
+  function step(dt){
+    const t = nowMs();
+
+    // Update moving & temp platforms
+    for (const p of platforms) p.update(dt, t);
+    for (let i=tempPlatforms.length-1;i>=0;i--){ const p=tempPlatforms[i]; p.update(dt,t); if (t >= p.expires) tempPlatforms.splice(i,1); }
+
+    // Spawn side projectiles
+    if (t - lastProjAt > PROJ_COOLDOWN) spawnProjectile(t);
+
+    // Player input
+    const left = downLeft(); const right = downRight(); const jumpHeld = downUp(); const crouch = downDown();
+    const justPressedJump = jumpHeld && !prevJump; prevJump = jumpHeld;
+
+    if (left && !right) player.facing = -1; else if (right && !left) player.facing = 1;
+    if (left && !right) player.vx = -MOVE_SPEED; else if (right && !left) player.vx = MOVE_SPEED; else player.vx *= player.onGround?FRICTION:AIR_DRAG;
+
+    // Coyote & buffered ground jump
+    player.coyote = (player.onGround ? 0.08 : Math.max(0, (player.coyote||0) - dt));
+    player.jumpBuf = (jumpHeld ? 0.08 : Math.max(0, (player.jumpBuf||0) - dt));
+    if ((player.coyote>0) && (player.jumpBuf>0)) { player.vy = JUMP_VY; player.onGround=false; player.coyote=0; player.jumpBuf=0; }
+
+    // Double jump with 3s cooldown — once per airtime
+    if (justPressedJump && !player.onGround && !player.usedDouble && t >= player.doubleReadyAt){
+      player.vy = JUMP_VY * 0.9; // a bit shorter than ground jump
+      player.usedDouble = true; player.doubleReadyAt = t + 3000; // cooldown
+      // little upward spark
+      spawnSparks(player.x+player.w/2, player.y+player.h, 10, '#a78bfa');
+    }
+
+    if (player.onGround){ player.usedDouble = false; }
+
+    if (crouch && player.onGround) player.vx += player.facing * 40 * dt;
+
+    // Physics
+    applyGravity(player, dt); collideWithPlatforms(player, dt, allPlatforms()); clampToWorld(player);
+
+    // Spikes instant death
+    if (AABB(player.rect(), SPIKES)) { playerDamage(999); }
+
+    // Projectiles update & collisions
+    for (let i=projectiles.length-1;i>=0;i--){
+      const pr = projectiles[i]; pr.x += pr.vx*dt; pr.y += pr.vy*dt; pr.life -= dt*1000;
+      // Parry check when near contact horizontally
+      const near = Math.abs((player.x+player.w/2) - (pr.x + (pr.w/2))) < 20 && Math.abs((player.y+player.h/2) - (pr.y+pr.h/2)) < 28;
+      const dParry = Math.abs(t - player.lastParry);
+      if (near && dParry <= 110){ spawnSparks(pr.x, pr.y, 14, '#e5e7eb'); projectiles.splice(i,1); continue; }
+      if (AABB(player.rect(), pr.rect())){ playerDamage(1); projectiles.splice(i,1); continue; }
+      if (pr.life<=0 || pr.x < -40 || pr.x > WORLD_W+40) { projectiles.splice(i,1); }
+    }
+
+    // Boss
+    bossAI(t, dt);
+
+    // Goal
+    if (AABB(player.rect(), GOAL)) paused = true;
+
+    // Camera
+    const targetX = clamp(player.x + player.w/2 - camera.w/2, 0, WORLD_W - camera.w);
+    const targetY = clamp(player.y + player.h/2 - camera.h/2 - 80, 0, WORLD_H - camera.h);
+    camera.x += (targetX - camera.x) * camera.lerp; camera.y += (targetY - camera.y) * camera.lerp;
+
+    // Effects
+    for (const s of sparks){ s.x += s.vx*dt; s.y += s.vy*dt; s.vy += 600*dt; s.life -= dt*1000; }
+    for (let i=sparks.length-1;i>=0;i--) if (sparks[i].life<=0) sparks.splice(i,1);
+    for (const sl of slashes){ sl.life -= dt*1000; }
+    for (let i=slashes.length-1;i>=0;i--) if (slashes[i].life<=0) slashes.splice(i,1);
+  }
+
+  // ===== Drawing =====
+  function drawStick(x, y, facing, color='#e5e7eb', swingStart=-9999, swingDur=200, swingType='none'){
+    const t = nowMs(); let prog = (t - swingStart)/swingDur; if (swingStart<0) prog = 0; prog = clamp(prog,0,1);
+    const headR=6, torsoH=14, armLen=10;
+    ctx.strokeStyle=color; ctx.lineWidth=3; ctx.lineCap='round';
+    // head
+    ctx.beginPath(); ctx.arc(x+14, y-30, headR, 0, Math.PI*2); ctx.stroke();
+    // torso
+    ctx.beginPath(); ctx.moveTo(x+14, y-24); ctx.lineTo(x+14, y-24+torsoH); ctx.stroke();
+    // off arm
+    ctx.beginPath(); ctx.moveTo(x+14, y-22); ctx.lineTo(x+6, y-18); ctx.stroke();
+    // swing
+    const shoulderX=x+14, shoulderY=y-22; const startAng=facing>0? Math.PI*0.95 : Math.PI*0.05; const endAng=facing>0? Math.PI*0.15 : Math.PI*0.85; const ang = startAng + (endAng-startAng)*(prog>0? (prog<0.5? (prog*2*0.7) : 0.7 + (prog-0.5)*2*0.3) : 0);
+    const handX = shoulderX + Math.cos(ang)*armLen*2; const handY = shoulderY + Math.sin(ang)*armLen*2;
+    ctx.beginPath(); ctx.moveTo(shoulderX, shoulderY); ctx.lineTo(handX, handY); ctx.stroke();
+    ctx.strokeStyle='#cbd5e1'; ctx.beginPath(); ctx.moveTo(handX, handY); ctx.lineTo(handX + Math.cos(ang)*12, handY + Math.sin(ang)*12); ctx.stroke();
+    // legs
+    ctx.strokeStyle=color; ctx.beginPath(); ctx.moveTo(x+14, y-10); ctx.lineTo(x+8, y+2); ctx.stroke(); ctx.beginPath(); ctx.moveTo(x+14, y-10); ctx.lineTo(x+20, y+2); ctx.stroke();
+  }
+
+  function render(){
+    ctx.save(); ctx.clearRect(0,0,canvas.width,canvas.height);
+    // bg
+    const g = ctx.createLinearGradient(0,0,0,DESIGN_H); g.addColorStop(0,'#0d1229'); g.addColorStop(1,'#0a0e1f'); ctx.fillStyle=g; ctx.fillRect(0,0,DESIGN_W,DESIGN_H);
+    ctx.translate(-Math.round(camera.x), -Math.round(camera.y));
+
+    // platforms (static + moving)
+    for (const p of platforms){ ctx.save(); ctx.globalAlpha=1; ctx.fillStyle='#1e293b'; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle='#2c3b58'; ctx.fillRect(p.x, p.y, p.w, 6); ctx.restore(); }
+    // temp platforms (fade)
+    for (const p of tempPlatforms){ ctx.save(); ctx.globalAlpha=p.alpha*0.9; ctx.fillStyle='#94a3b8'; ctx.fillRect(p.x, p.y, p.w, p.h); ctx.fillStyle='#cbd5e1'; ctx.fillRect(p.x, p.y, p.w, 4); ctx.restore(); }
+
+    // spikes
+    const sz=16; ctx.fillStyle='#7f1d1d'; ctx.fillRect(SPIKES.x, SPIKES.y, SPIKES.w, SPIKES.h); ctx.fillStyle='#ef4444'; for (let x=0; x<SPIKES.w; x+=sz){ ctx.beginPath(); ctx.moveTo(x, SPIKES.y); ctx.lineTo(x+sz/2, SPIKES.y - sz); ctx.lineTo(x+sz, SPIKES.y); ctx.closePath(); ctx.fill(); }
+
+    // goal
+    ctx.fillStyle='#10b981'; ctx.fillRect(GOAL.x, GOAL.y, GOAL.w, GOAL.h);
+
+    // projectiles
+    for (const pr of projectiles){ ctx.fillStyle = '#a78bfa'; ctx.fillRect(pr.x, pr.y, pr.w, pr.h); ctx.fillStyle='#c4b5fd'; ctx.fillRect(pr.x+(pr.fromLeft?4:2), pr.y+2, pr.w/2, pr.h/3); }
+
+    // boss & player
+    drawStick(boss.x, boss.y+boss.h, boss.dir, '#fecaca', boss.swingStart, boss.swingDur, 'parry');
+    drawStick(player.x, player.y+player.h, player.facing, '#e5e7eb', player.swingStart, player.swingDur, player.swingType);
+
+    // effects
+    for (const s of sparks){ ctx.globalAlpha = Math.max(0, s.life/240); ctx.fillStyle=s.color; ctx.fillRect(s.x, s.y, 2,2); ctx.globalAlpha = 1; }
+    for (const sl of slashes){ const a=Math.max(0, sl.life/200); ctx.globalAlpha=a; ctx.fillStyle=sl.color; const len=sl.radius, h=sl.thickness; const x0=sl.x, y0=sl.y; ctx.beginPath(); if (sl.dir>0){ ctx.moveTo(x0, y0-4); ctx.lineTo(x0+len, y0); ctx.lineTo(x0, y0+h); } else { ctx.moveTo(x0, y0-4); ctx.lineTo(x0-len, y0); ctx.lineTo(x0, y0+h); } ctx.closePath(); ctx.fill(); ctx.globalAlpha=1; }
+
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle='rgba(0,0,0,.45)'; ctx.fillRect(10,10, 560, 130); ctx.fillStyle='#cbd5e1'; ctx.font='14px system-ui,Segoe UI,Roboto,Arial';
+    ctx.fillText(`HP: ${player.hp}/3`, 20, 32); if (showFPS) ctx.fillText(`FPS: ${fps}`, 120, 32);
+    // Double-jump cooldown bar
+    const t = nowMs();
+    const readyIn = Math.max(0, player.doubleReadyAt - t);
+    ctx.fillText(`Double Jump: ${readyIn<=0? 'READY' : (Math.ceil(readyIn/100)/10 + 's')}`, 20, 54);
+    ctx.fillStyle='#111827'; ctx.fillRect(20, 60, 160, 10);
+    const frac = 1 - clamp(readyIn/3000, 0, 1);
+    ctx.fillStyle = readyIn<=0? '#10b981' : '#a78bfa'; ctx.fillRect(20, 60, 160*frac, 10);
+    ctx.fillStyle='#cbd5e1'; ctx.fillText('Side projectiles can be parried (perfect timing) to destroy', 20, 86);
+
+    if (paused){ ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,DESIGN_W,DESIGN_H); ctx.fillStyle='#e5e7eb'; ctx.font='bold 24px system-ui,Segoe UI,Roboto,Arial'; ctx.fillText('You reached the top! (Press P to resume)', 80, DESIGN_H/2); }
+  }
+})();
+</script>
+</body>
+</html>
